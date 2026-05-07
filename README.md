@@ -13,17 +13,12 @@ A system that automatically shares your mouse between multiple Windows laptops b
 ```
 cnm/
 ├── host.py               # Run on the HOST machine (the one that owns the mouse)
-│
 ├── client_webcam.py      # CLIENT — uses built-in/USB webcam (simpler, recommended)
 ├── client.py             # CLIENT — uses DroidCam / IP camera URL (phone as webcam)
-│
 ├── gaze_tracker.py       # MediaPipe-based face gaze detection (shared module)
 ├── network_utils.py      # Packet serialization / port constants (shared module)
+├── native_mouse.py       # Win32 High-performance mouse engine (shared module)
 ├── face_landmarker.task  # MediaPipe Face Landmarker ML model (required)
-├── download_model.py     # Script to download face_landmarker.task if missing
-├── check_cameras.py      # Diagnostic: list available camera indices
-├── check_host.py         # Diagnostic: find your host machine's LAN IP + port check
-├── test_connection.py    # Diagnostic: test DroidCam / IP camera URL
 ├── requirements.txt      # Python dependencies
 └── README.md             # This file
 ```
@@ -75,40 +70,8 @@ pip install -r requirements.txt
 
 > **Note:** `pyzmq` is listed in requirements.txt for optional future use but is not actively used by the current code. All other packages are required.
 
-### Step 3 — Download the ML model
-
-The file `face_landmarker.task` (~3.6 MB) must exist in the project folder. If it's missing:
-
-```powershell
-python download_model.py
-```
-
-This downloads it from Google's MediaPipe model repository. If it already exists, the script skips it.
-
-### Step 4 — Find the Host machine's IP address
-
-Run this on the **HOST machine**:
-
-```powershell
-python check_host.py
-```
-
-Look for the line:
-```
-Primary IP: 192.168.x.x  <-- USE THIS IP ON THE CLIENT!
-```
-
-Note this IP — you'll need it in Step 6.
-
-### Step 5 — (Optional) Identify your camera index
-
-If you're unsure which camera index to use (especially with external webcams):
-
-```powershell
-python check_cameras.py
-```
-
-Default is `0` (built-in webcam). Use the listed index if needed.
+### Step 3 — Ensure the ML model is present
+The file `face_landmarker.task` (~3.6 MB) must exist in the project folder. This is required for MediaPipe to detect facial landmarks.
 
 ---
 
@@ -205,8 +168,6 @@ Calibration is **coordinated** — the host triggers it for all machines simulta
 
 > **Tip:** For best results, keep your head fairly still and look directly at the camera during calibration.
 
----
-
 ## 🖱️ Focus Switching Behavior
 
 | You look at... | What happens |
@@ -266,12 +227,8 @@ Try different indices (0, 1, 2...) until you find the working one.
 
 1. Install [DroidCam](https://www.dev47apps.com/) on your Android phone.
 2. Connect phone to the **same Wi-Fi** as your laptops.
-3. Note the URL shown in the DroidCam app (e.g., `http://192.168.1.9:4747`).
-4. Test the connection:
-   ```powershell
-   python test_connection.py http://192.168.1.9:4747
-   ```
-5. Use `client.py` (not `client_webcam.py`) with the confirmed URL:
+3. Open DroidCam — note the URL shown (e.g., `http://192.168.1.9:4747`).
+4. Run the client with the DroidCam URL:
    ```powershell
    python client.py <HOST_IP> http://192.168.1.9:4747/video
    ```
