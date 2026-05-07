@@ -110,6 +110,10 @@ Default is `0` (built-in webcam). Use the listed index if needed.
 
 ## ▶️ Running the Application
 
+> **All scripts run in the background — no camera window is shown.**
+> Gaze is processed at **8 fps on 640×480 frames** for maximum speed.
+> Status is printed to the terminal every 5 seconds.
+
 ### Step 1 — On the HOST machine
 
 ```powershell
@@ -123,9 +127,10 @@ python host.py 1
 ```
 
 The host will:
-- Open a window showing your face with gaze confidence overlay
 - Start listening for client connections on all 3 ports
-- Display **"HOST FOCUSED"** (green) or **"HOST AWAY"** (red)
+- Run gaze tracking silently in the background
+- Print status like `gaze=0.82 (FOCUSED) | owner=host` every 5 seconds
+- **Press `ENTER` in the terminal** to start calibration (replaces the old `C` key)
 
 ---
 
@@ -177,8 +182,9 @@ python client_webcam.py 192.168.1.10 1
 
 Both client scripts will:
 - Connect to the host's TCP and gaze ports
-- Open a camera window showing gaze tracking
+- Run gaze tracking silently in the background (no camera window)
 - Wait for calibration signal from host
+- Print status like `gaze=0.76 (FOCUSED) | calibrated` every 5 seconds
 
 ---
 

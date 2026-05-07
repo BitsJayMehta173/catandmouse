@@ -1,3 +1,20 @@
+"""
+client.py — CLIENT using DroidCam / IP camera URL (phone as webcam).
+
+Runs fully in the background (no camera window).
+Gaze is processed at 8 fps on 640x480 frames for low CPU usage and fast switching.
+
+Usage:
+    python client.py <HOST_IP> <CAMERA_URL>
+
+Examples:
+    python client.py 192.168.1.10 http://192.168.1.9:4747/video
+    python client.py 192.168.1.10 http://192.168.1.9:4747/mjpegfeed
+
+Run 'python test_connection.py http://<PHONE_IP>:4747' to confirm your URL first.
+For a built-in/USB webcam, use client_webcam.py instead.
+"""
+
 import socket
 import threading
 import time
@@ -8,68 +25,69 @@ from pynput import mouse
 import network_utils
 from gaze_tracker import GazeTracker
 
-# Make all coordinate operations consistent with physical pixels,
-# regardless of Windows DPI scaling (100%, 125%, 150%, etc.)
 try:
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
 
+# ── Performance constants ──────────────────────────────────────────────────────
+GAZE_FPS       = 8
+GAZE_INTERVAL  = 1.0 / GAZE_FPS
+PROCESS_W      = 640
+PROCESS_H      = 480
+SEND_THRESHOLD = 0.02   # Send gaze update when confidence changes by this much
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 class ClientController:
-    def __init__(self, host_ip, camera_source=0):
-        self.host_ip = host_ip
+    def __init__(self, host_ip, camera_source):
+        self.host_ip       = host_ip
         self.camera_source = camera_source
         self.mouse_controller = mouse.Controller()
         self.should_calibrate = False
-        self.tracker = None
-        
+
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp_sock.bind(('0.0.0.0', network_utils.UDP_PORT))
-        
+
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
+
         self.gaze_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.gaze_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     def start(self):
-        print(f"Connecting to Host {self.host_ip}...")
-        
-        # Connect TCP for clicks
+        print(f"[Client] Connecting to Host {self.host_ip}...")
+
         while True:
             try:
-                print(f"Attempting TCP connection to {self.host_ip}:{network_utils.TCP_PORT}...")
+                print(f"[TCP] Connecting to {self.host_ip}:{network_utils.TCP_PORT}...")
                 self.tcp_sock.connect((self.host_ip, network_utils.TCP_PORT))
-                print("[TCP] Connected for clicks.")
+                print("[TCP] Connected.")
                 break
             except Exception as e:
-                print(f"[TCP] Connection failed: {e}. Retrying in 2s...")
+                print(f"[TCP] Failed: {e}. Retrying in 2s...")
                 time.sleep(2)
 
-        # Connect TCP for gaze
         while True:
             try:
-                print(f"Attempting Gaze connection to {self.host_ip}:{network_utils.GAZE_PORT}...")
+                print(f"[Gaze] Connecting to {self.host_ip}:{network_utils.GAZE_PORT}...")
                 self.gaze_sock.connect((self.host_ip, network_utils.GAZE_PORT))
-                print("[Gaze] Connected to send gaze data.")
+                print("[Gaze] Connected.")
                 break
             except Exception as e:
-                print(f"[Gaze] Connection failed: {e}. Retrying in 2s...")
+                print(f"[Gaze] Failed: {e}. Retrying in 2s...")
                 time.sleep(2)
 
-        # Start listening threads
         threading.Thread(target=self.listen_udp, daemon=True).start()
         threading.Thread(target=self.listen_tcp, daemon=True).start()
-        
-        # Start Vision processing in main thread
+
         self.run_vision()
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
     def _recv_exact(self, sock, n):
-        """Read exactly n bytes from sock, blocking until all arrive.
-        Returns bytes or raises ConnectionError if socket closes early.
-        """
         buf = b''
         while len(buf) < n:
             chunk = sock.recv(n - len(buf))
@@ -79,24 +97,14 @@ class ClientController:
         return buf
 
     def _send_click(self, button_id, pressed):
-        """Inject a click via SendInput so it goes through the same Win32
-        pathway as SetCursorPos (avoids pynput/SendInput level mismatch)."""
         INPUT_MOUSE = 0
-        MOUSEEVENTF_LEFTDOWN   = 0x0002
-        MOUSEEVENTF_LEFTUP     = 0x0004
-        MOUSEEVENTF_RIGHTDOWN  = 0x0008
-        MOUSEEVENTF_RIGHTUP    = 0x0010
-        MOUSEEVENTF_MIDDLEDOWN = 0x0020
-        MOUSEEVENTF_MIDDLEUP   = 0x0040
+        flags = {
+            (1, True):  0x0002, (1, False): 0x0004,
+            (2, True):  0x0008, (2, False): 0x0010,
+            (3, True):  0x0020, (3, False): 0x0040,
+        }
+        flag = flags.get((button_id, pressed), 0x0002)
 
-        if button_id == 1:
-            flag = MOUSEEVENTF_LEFTDOWN if pressed else MOUSEEVENTF_LEFTUP
-        elif button_id == 2:
-            flag = MOUSEEVENTF_RIGHTDOWN if pressed else MOUSEEVENTF_RIGHTUP
-        else:
-            flag = MOUSEEVENTF_MIDDLEDOWN if pressed else MOUSEEVENTF_MIDDLEUP
-
-        # MOUSEINPUT structure: dx, dy, mouseData, dwFlags, time, dwExtraInfo
         class MOUSEINPUT(ctypes.Structure):
             _fields_ = [('dx', ctypes.c_long), ('dy', ctypes.c_long),
                         ('mouseData', ctypes.c_ulong), ('dwFlags', ctypes.c_ulong),
@@ -113,9 +121,6 @@ class ClientController:
         ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
     def _send_scroll(self, dx, dy):
-        """Inject a scroll wheel event via SendInput."""
-        MOUSEEVENTF_WHEEL  = 0x0800
-        MOUSEEVENTF_HWHEEL = 0x01000
         WHEEL_DELTA = 120
 
         class MOUSEINPUT(ctypes.Structure):
@@ -131,61 +136,45 @@ class ClientController:
 
         if dy != 0:
             inp = INPUT(type=0)
-            inp.mi.dwFlags = MOUSEEVENTF_WHEEL
+            inp.mi.dwFlags = 0x0800
             inp.mi.mouseData = ctypes.c_ulong(int(dy * WHEEL_DELTA))
             ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
-
         if dx != 0:
             inp = INPUT(type=0)
-            inp.mi.dwFlags = MOUSEEVENTF_HWHEEL
+            inp.mi.dwFlags = 0x01000
             inp.mi.mouseData = ctypes.c_ulong(int(dx * WHEEL_DELTA))
             ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    # ── Network listeners ─────────────────────────────────────────────────────
 
     def listen_udp(self):
         print("[UDP] Listening for mouse movement...")
         user32 = ctypes.windll.user32
         while True:
             try:
-                data, addr = self.udp_sock.recvfrom(1024)
+                data, _ = self.udp_sock.recvfrom(1024)
                 if not data:
                     continue
-                packet_type = struct.unpack('!B', data[:1])[0]
-                if packet_type == 1:
+                if struct.unpack('!B', data[:1])[0] == 1:
                     px, py = network_utils.unpack_move(data)
-
-                    # Use GetSystemMetrics in physical-pixel mode (guaranteed by
-                    # SetProcessDPIAware above) to map the 0–1 fraction to screen coords.
                     sw = user32.GetSystemMetrics(0)
                     sh = user32.GetSystemMetrics(1)
-
-                    # Clamp to valid range before converting
                     px = max(0.0, min(1.0, px))
                     py = max(0.0, min(1.0, py))
-
-                    target_x = int(px * (sw - 1))
-                    target_y = int(py * (sh - 1))
-
-                    user32.SetCursorPos(target_x, target_y)
+                    user32.SetCursorPos(int(px * (sw - 1)), int(py * (sh - 1)))
             except Exception as e:
                 print(f"[UDP] Error: {e}")
 
     def listen_tcp(self):
         print("[TCP] Listening for clicks/scrolls...")
-        # Packet sizes by type byte:
-        #   type 2 (click):   3 bytes total
-        #   type 3 (scroll):  9 bytes total
-        #   type 4 (control): 2 bytes total
         TOTAL_SIZE = {2: 3, 3: 9, 4: 2}
-
         while True:
             try:
-                # Read the type byte first (always 1 byte)
-                type_byte = self._recv_exact(self.tcp_sock, 1)
+                type_byte   = self._recv_exact(self.tcp_sock, 1)
                 packet_type = struct.unpack('!B', type_byte)[0]
-
-                remaining = TOTAL_SIZE.get(packet_type, 0) - 1
-                rest = self._recv_exact(self.tcp_sock, remaining) if remaining > 0 else b''
-                data = type_byte + rest
+                remaining   = TOTAL_SIZE.get(packet_type, 0) - 1
+                rest        = self._recv_exact(self.tcp_sock, remaining) if remaining > 0 else b''
+                data        = type_byte + rest
 
                 if packet_type == 2:
                     button_id, pressed = network_utils.unpack_click(data)
@@ -194,12 +183,11 @@ class ClientController:
                     dx, dy = network_utils.unpack_scroll(data)
                     self._send_scroll(dx, dy)
                 elif packet_type == 4:
-                    cmd_id = network_utils.unpack_control(data)
-                    if cmd_id == 1:
-                        print("[Control] Received calibration command from Host")
+                    if network_utils.unpack_control(data) == 1:
+                        print("[Control] Calibration command received from Host")
                         self.should_calibrate = True
                 else:
-                    print(f"[TCP] Unknown packet type: {packet_type}, skipping")
+                    print(f"[TCP] Unknown packet type: {packet_type}")
             except ConnectionError as e:
                 print(f"[TCP] Connection closed: {e}")
                 break
@@ -207,96 +195,136 @@ class ClientController:
                 print(f"[TCP] Error: {e}")
                 break
 
-    def run_vision(self):
-        print(f"[Vision] Initializing camera source: {self.camera_source}...")
-        
+    # ── Vision (headless, background capture) ─────────────────────────────────
+
+    def _open_camera(self):
+        """Open camera with FFMPEG for URLs, DSHOW for integer indices."""
         source = self.camera_source
+        # Normalise string integers
         if isinstance(source, str) and source.isdigit():
             source = int(source)
-            
-        cap = None
+
         if isinstance(source, int):
-            print(f"[Vision] Using local camera index {source} with DSHOW")
+            print(f"[Vision] Opening local camera index {source} with DSHOW...")
             cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
         else:
-            # It's a URL. Try FFMPEG first as it's usually better for network streams
-            print(f"[Vision] Attempting to open URL {source} with FFMPEG...")
+            print(f"[Vision] Opening URL: {source}")
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-            
             if not cap.isOpened():
-                print(f"[Vision] FFMPEG failed, trying default backend...")
+                print("[Vision] FFMPEG failed — trying default backend...")
                 cap = cv2.VideoCapture(source)
 
-        if not cap or not cap.isOpened():
-            print(f"[Vision] Error: Could not open camera source: {source}")
-            print("[Vision] Troubleshooting tips:")
-            print("1. Make sure DroidCam is running on your phone.")
-            print(f"2. Try running: python test_connection.py {source.rsplit('/', 1)[0] if isinstance(source, str) else ''}")
+        return cap if cap and cap.isOpened() else None
+
+    def run_vision(self):
+        cap = self._open_camera()
+
+        if cap is None:
+            print(f"[Vision] Error: Could not open camera source: {self.camera_source}")
+            print("  Tips:")
+            print("  1. Make sure DroidCam is running on your phone.")
+            print("  2. Run: python test_connection.py http://<PHONE_IP>:4747")
             return
 
-        self.tracker = GazeTracker()
-        
-        print("Waiting for Host to start calibration (Press 'C' on Host)...")
-        
-        last_gaze_conf     = -1.0  # last sent confidence value
-        SEND_THRESHOLD      = 0.03  # only send when confidence changes by this much
-        consecutive_failures = 0
-        
-        while cap.isOpened():
-            if self.should_calibrate:
-                print("[Vision] Starting calibration...")
-                self.tracker.is_calibrated = False
-                self.tracker.calibration_samples = []
-                self.should_calibrate = False
+        print(f"[Vision] Camera ready. Processing gaze at {GAZE_FPS} fps ({PROCESS_W}x{PROCESS_H}).")
 
-            success, frame = cap.read()
-            if not success:
-                consecutive_failures += 1
-                if consecutive_failures > 30:
-                    print("[Vision] Error: Consecutive frame grab failures. Camera might be disconnected.")
-                    break
-                continue
-            
-            consecutive_failures = 0
+        # ── Background capture thread — always keeps only the latest frame ─────
+        latest_frame     = [None]
+        frame_lock       = threading.Lock()
+        consecutive_fail = [0]
 
-            annotated_image, confidence, angles = self.tracker.process_frame(frame)
+        def _capture_loop():
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    consecutive_fail[0] = 0
+                    small = cv2.resize(frame, (PROCESS_W, PROCESS_H))
+                    with frame_lock:
+                        latest_frame[0] = small
+                else:
+                    consecutive_fail[0] += 1
+                    if consecutive_fail[0] > 60:
+                        print("[Vision] Error: Too many consecutive frame failures. "
+                              "Camera may be disconnected.")
+                        break
+                    time.sleep(0.05)
 
-            if not self.tracker.is_calibrated:
-                cv2.putText(annotated_image, "CALIBRATING CLIENT...", (20, 130),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        threading.Thread(target=_capture_loop, daemon=True).start()
 
-            # Send confidence to host only when it changes meaningfully
-            if abs(confidence - last_gaze_conf) >= SEND_THRESHOLD:
-                try:
-                    self.gaze_sock.sendall(network_utils.pack_gaze(confidence))
-                    last_gaze_conf = confidence
-                except Exception as e:
-                    print(f"Failed to send gaze confidence: {e}")
-            
-            try:
-                cv2.imshow('Client Gaze Tracker', annotated_image)
-            except Exception as e:
-                print(f"[Vision] Warning: Could not display window: {e}")
-                
-            if cv2.waitKey(5) & 0xFF == 27:
-                break
-                
-        cap.release()
-        cv2.destroyAllWindows()
+        tracker = GazeTracker(headless=True)
+        print("[Client] Waiting for calibration signal from Host...")
+
+        last_gaze_conf = -1.0
+        last_process   = 0.0
+        loop_count     = 0
+
+        try:
+            while True:
+                now  = time.time()
+                wait = GAZE_INTERVAL - (now - last_process)
+                if wait > 0:
+                    time.sleep(wait)
+
+                # Handle calibration request from host
+                if self.should_calibrate:
+                    print("[Vision] Starting calibration — look straight at camera...")
+                    tracker.is_calibrated      = False
+                    tracker.calibration_samples = []
+                    self.should_calibrate      = False
+
+                with frame_lock:
+                    frame = latest_frame[0]
+
+                if frame is None:
+                    time.sleep(0.02)
+                    continue
+
+                last_process = time.time()
+                loop_count  += 1
+
+                _, confidence, _ = tracker.process_frame(frame)
+
+                # Send gaze update only when confidence changes meaningfully
+                if abs(confidence - last_gaze_conf) >= SEND_THRESHOLD:
+                    try:
+                        self.gaze_sock.sendall(network_utils.pack_gaze(confidence))
+                        last_gaze_conf = confidence
+                    except Exception as e:
+                        print(f"[Gaze] Send error: {e}")
+
+                # Status log every 5 seconds
+                if loop_count % (GAZE_FPS * 5) == 0:
+                    focused = confidence >= 0.40
+                    status  = "FOCUSED" if focused else "AWAY"
+                    calib   = "calibrated" if tracker.is_calibrated else "NOT calibrated"
+                    print(f"[Client] gaze={confidence:.2f} ({status}) | {calib}")
+
+        except KeyboardInterrupt:
+            print("\n[Client] Shutting down.")
+        finally:
+            cap.release()
+
 
 if __name__ == "__main__":
     import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <HOST_IP> [CAMERA_SOURCE]")
-        print("Examples:")
-        print("  python client.py 192.168.1.10")
-        print("  python client.py 192.168.1.10 1")
+
+    if len(sys.argv) < 3:
+        print("=" * 60)
+        print("  Cat & Mouse — Client (DroidCam / IP Camera)")
+        print("=" * 60)
+        print("\nUsage:")
+        print("  python client.py <HOST_IP> <CAMERA_URL>")
+        print("\nExamples:")
         print("  python client.py 192.168.1.10 http://192.168.1.9:4747/video")
+        print("  python client.py 192.168.1.10 http://192.168.1.9:4747/mjpegfeed")
+        print("\nTest your camera URL first:")
+        print("  python test_connection.py http://192.168.1.9:4747")
+        print("\nRun 'python check_host.py' on HOST to find its IP.")
+        print("\nFor a built-in/USB webcam, use client_webcam.py instead.")
         sys.exit(1)
-        
-    host_ip = sys.argv[1]
-    camera_source = sys.argv[2] if len(sys.argv) > 2 else 0
-    
+
+    host_ip       = sys.argv[1]
+    camera_source = sys.argv[2]
+
     client = ClientController(host_ip, camera_source)
     client.start()

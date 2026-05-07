@@ -59,7 +59,11 @@ class GazeTracker:
     decisive winner even for small inter-camera angles.
     """
 
-    def __init__(self):
+    def __init__(self, headless=False):
+        """
+        headless=True: skips all cv2 drawing operations (mesh, overlays, labels).
+        Use this for background / no-window mode for maximum speed.
+        """
         model_path = os.path.join(os.path.dirname(__file__), 'face_landmarker.task')
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"'{model_path}' not found. Run download_model.py first.")
@@ -75,20 +79,26 @@ class GazeTracker:
         self.baseline_yaw   = None
         self.is_calibrated  = False
         self.calibration_samples: list = []
+        self.headless       = headless
 
     # ------------------------------------------------------------------
     def process_frame(self, frame: np.ndarray):
+        """
+        Returns (annotated_frame_or_None, confidence, angles).
+        In headless mode annotated_frame is None — do not try to display it.
+        """
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.detector.detect(mp_img)
 
-        out        = frame.copy()
+        out        = None if self.headless else frame.copy()
         confidence = 0.0
         angles     = (0.0, 0.0, 0.0)
 
         if not result.face_landmarks:
-            cv2.putText(out, "No face", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            if not self.headless:
+                cv2.putText(out, "No face", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
             return out, 0.0, angles
 
         landmarks = result.face_landmarks[0]
@@ -103,10 +113,11 @@ class GazeTracker:
         # ---------- calibration ----------
         if not self.is_calibrated:
             self.calibration_samples.append(yaw)
-            pct = int(len(self.calibration_samples) / CALIB_FRAMES * 100)
-            cv2.putText(out, f"Calibrating {pct}% – look straight at camera",
-                        (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-            self._draw_mesh(out, landmarks, img_w, img_h, confidence=0.0)
+            if not self.headless:
+                pct = int(len(self.calibration_samples) / CALIB_FRAMES * 100)
+                cv2.putText(out, f"Calibrating {pct}% – look straight at camera",
+                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                self._draw_mesh(out, landmarks, img_w, img_h, confidence=0.0)
             if len(self.calibration_samples) >= CALIB_FRAMES:
                 self.baseline_yaw = float(np.median(self.calibration_samples))
                 self.is_calibrated = True
@@ -120,11 +131,12 @@ class GazeTracker:
         # ---------- combined confidence ----------
         confidence = 0.6 * yaw_score + 0.4 * sym_score
 
-        # ---------- overlays ----------
-        self._draw_mesh(out, landmarks, img_w, img_h, confidence)
-        self._draw_arrow(out, nose_px, yaw, pitch)
-        self._draw_bar(out, confidence, img_h)
-        self._draw_labels(out, confidence, yaw, d_yaw, sym_score)
+        # ---------- overlays (skipped in headless mode) ----------
+        if not self.headless:
+            self._draw_mesh(out, landmarks, img_w, img_h, confidence)
+            self._draw_arrow(out, nose_px, yaw, pitch)
+            self._draw_bar(out, confidence, img_h)
+            self._draw_labels(out, confidence, yaw, d_yaw, sym_score)
 
         return out, confidence, angles
 
