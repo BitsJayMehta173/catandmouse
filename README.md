@@ -1,5 +1,9 @@
 # 🐱 Cat and Mouse — Gaze-Driven Cross-Laptop Mouse Sharing
 
+Suppose you have to work on two laptop simultaneously now you want to work with the single mouse and you want to look in a specific laptop and use the same mouse for both the laptop you can do it with this so what we are doing is looking to the specific laptop and using a single mouse for both, one laptops mouse controls will be shifted to another one.
+
+While I have two laptops and a single wireless or wired mouse and want to use the mouse for both the laptop by just seeing the screen of the specific laptop we will use this for it.
+
 A system that automatically shares your mouse between multiple Windows laptops based on **where you're looking**. Using real-time facial gaze tracking (MediaPipe), the host laptop detects which screen you're facing and seamlessly hands off mouse control — including movement, clicks, and scrolling — to the appropriate client machine over a local Wi-Fi network.
 
 ---
