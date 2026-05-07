@@ -2,7 +2,8 @@
 client_webcam.py — CLIENT using the machine's built-in / default webcam.
 
 Runs fully in the background (no camera window).
-Gaze is processed at 8 fps on 640x480 frames for low CPU usage and fast switching.
+Uses native Win32 mouse interpolation at 240Hz for natural cursor feel.
+Gaze is processed at 12 fps on 640x480 frames.
 
 Usage:
     python client_webcam.py <HOST_IP> [CAMERA_INDEX]
@@ -23,18 +24,25 @@ import ctypes
 from pynput import mouse
 import network_utils
 from gaze_tracker import GazeTracker
+from native_mouse import NativeMouseInterpolator
 
 try:
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
     pass
 
+# Enable 1ms timer resolution
+try:
+    ctypes.windll.winmm.timeBeginPeriod(1)
+except Exception:
+    pass
+
 # ── Performance constants ──────────────────────────────────────────────────────
-GAZE_FPS      = 8
+GAZE_FPS      = 12          # Up from 8 → faster focus switching
 GAZE_INTERVAL = 1.0 / GAZE_FPS
 PROCESS_W     = 640
 PROCESS_H     = 480
-SEND_THRESHOLD = 0.02   # Send gaze update when confidence changes by this much
+SEND_THRESHOLD = 0.015      # Tighter threshold → more responsive gaze updates
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -56,14 +64,12 @@ class ClientController:
         self.gaze_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.gaze_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # ── Mouse Interpolation Pipeline ──────────────────────────────────────
-        self.target_x_norm  = 0.5
-        self.target_y_norm  = 0.5
-        self.curr_x_norm    = 0.5
-        self.curr_y_norm    = 0.5
-        self.mouse_lock     = threading.Lock()
-        self.LERP_FACTOR    = 0.35  # Smoothness vs Latency (higher = snappier)
-        self.DEADBAND       = 0.0001 # Ignore micro-movements
+        # ── Native Mouse Interpolator (240Hz, EMA + velocity prediction) ──────
+        self.mouse_engine = NativeMouseInterpolator(
+            update_hz=240,
+            smoothing=0.45,
+            velocity_weight=0.15
+        )
         # ──────────────────────────────────────────────────────────────────────
 
     def start(self):
@@ -89,9 +95,11 @@ class ClientController:
                 print(f"[Gaze] Failed: {e}. Retrying in 2s...")
                 time.sleep(2)
 
+        # Start native mouse engine
+        self.mouse_engine.start()
+
         threading.Thread(target=self.listen_udp, daemon=True).start()
         threading.Thread(target=self.listen_tcp, daemon=True).start()
-        threading.Thread(target=self.mouse_interpolator, daemon=True).start()
 
         self.run_vision()
 
@@ -155,36 +163,13 @@ class ClientController:
             inp.mi.mouseData = ctypes.c_ulong(int(dx * WHEEL_DELTA))
             ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
-    # ── Mouse & Network listeners ─────────────────────────────────────────────
-
-    def mouse_interpolator(self):
-        """
-        High-frequency thread (120Hz) that smoothly moves the cursor toward
-        the latest target received from UDP. This eliminates 'jumping' feel.
-        """
-        user32 = ctypes.windll.user32
-        sw = user32.GetSystemMetrics(0)
-        sh = user32.GetSystemMetrics(1)
-        
-        while True:
-            time.sleep(1/120.0) # 120 Hz update
-            
-            with self.mouse_lock:
-                tx, ty = self.target_x_norm, self.target_y_norm
-            
-            # Linear Interpolation (Lerp)
-            dx = tx - self.curr_x_norm
-            dy = ty - self.curr_y_norm
-            
-            if abs(dx) > self.DEADBAND or abs(dy) > self.DEADBAND:
-                self.curr_x_norm += dx * self.LERP_FACTOR
-                self.curr_y_norm += dy * self.LERP_FACTOR
-                
-                target_x = int(self.curr_x_norm * (sw - 1))
-                target_y = int(self.curr_y_norm * (sh - 1))
-                user32.SetCursorPos(target_x, target_y)
+    # ── Network listeners ─────────────────────────────────────────────────────
 
     def listen_udp(self):
+        """
+        Receives mouse position packets from host.
+        Feeds them directly to the native interpolation engine.
+        """
         print("[UDP] Listening for mouse movement...")
         while True:
             try:
@@ -193,9 +178,7 @@ class ClientController:
                     continue
                 if struct.unpack('!B', data[:1])[0] == 1:
                     px, py = network_utils.unpack_move(data)
-                    with self.mouse_lock:
-                        self.target_x_norm = max(0.0, min(1.0, px))
-                        self.target_y_norm = max(0.0, min(1.0, py))
+                    self.mouse_engine.update_target(px, py)
             except Exception as e:
                 print(f"[UDP] Error: {e}")
 
@@ -265,7 +248,7 @@ class ClientController:
 
         try:
             while True:
-                now  = time.time()
+                now  = time.perf_counter()
                 wait = GAZE_INTERVAL - (now - last_process)
                 if wait > 0:
                     time.sleep(wait)
@@ -284,7 +267,7 @@ class ClientController:
                     time.sleep(0.02)
                     continue
 
-                last_process = time.time()
+                last_process = time.perf_counter()
                 loop_count  += 1
 
                 _, confidence, _ = tracker.process_frame(frame)
@@ -297,8 +280,8 @@ class ClientController:
                     except Exception as e:
                         print(f"[Gaze] Send error: {e}")
 
-                # Status log every 5 seconds
-                if loop_count % (GAZE_FPS * 5) == 0:
+                # Status log every 3 seconds
+                if loop_count % (GAZE_FPS * 3) == 0:
                     focused = confidence >= 0.40
                     status  = "FOCUSED" if focused else "AWAY"
                     calib   = "calibrated" if tracker.is_calibrated else "NOT calibrated"
@@ -307,6 +290,7 @@ class ClientController:
         except KeyboardInterrupt:
             print("\n[Client] Shutting down.")
         finally:
+            self.mouse_engine.stop()
             cap.release()
 
 

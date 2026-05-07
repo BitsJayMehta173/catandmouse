@@ -13,10 +13,16 @@ try:
 except Exception:
     pass
 
+# Enable 1ms timer resolution for the entire process
+try:
+    ctypes.windll.winmm.timeBeginPeriod(1)
+except Exception:
+    pass
+
 # ── Performance constants ──────────────────────────────────────────────────────
-GAZE_FPS      = 8          # How many times per second gaze is computed
+GAZE_FPS      = 12         # Gaze checks per second (up from 8 → faster switching)
 GAZE_INTERVAL = 1.0 / GAZE_FPS
-PROCESS_W     = 640        # Frame width fed to MediaPipe (smaller = faster)
+PROCESS_W     = 640        # Frame width fed to MediaPipe
 PROCESS_H     = 480        # Frame height fed to MediaPipe
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -35,7 +41,7 @@ class HostController:
 
         # ── Mouse Throttling ──────────────────────────────────────────────────
         self.last_send_time = 0.0
-        self.SEND_INTERVAL  = 1.0 / 90.0  # 90Hz limit
+        self.SEND_INTERVAL  = 1.0 / 120.0  # 120Hz (up from 90Hz)
         # ──────────────────────────────────────────────────────────────────────
 
         # Sockets
@@ -98,9 +104,9 @@ class HostController:
             if (dx != 0 or dy != 0) and self.active_client_ip:
                 self.vx = max(0.0, min(1.0, self.vx + (dx / sw) * self.sensitivity))
                 self.vy = max(0.0, min(1.0, self.vy + (dy / sh) * self.sensitivity))
-                
-                # Throttle sending to ~90Hz to avoid network saturation
-                now = time.time()
+
+                # Throttle sending to ~120Hz
+                now = time.perf_counter()  # Higher precision than time.time()
                 if now - self.last_send_time >= self.SEND_INTERVAL:
                     try:
                         pkt = network_utils.pack_move(self.vx, self.vy)
@@ -186,11 +192,11 @@ class HostController:
 
     def focus_arbiter(self):
         """
-        Runs at 10 Hz. Switches focus to whichever device has the highest
-        gaze confidence, provided it beats the current owner by MARGIN.
+        Runs at 15 Hz (up from 10 Hz). Switches focus to whichever device has
+        the highest gaze confidence, provided it beats the current owner by MARGIN.
         """
         MARGIN   = 0.06
-        INTERVAL = 0.10
+        INTERVAL = 1.0 / 15.0   # 15 Hz (faster arbitration)
         loop_count = 0
 
         while True:
@@ -200,7 +206,7 @@ class HostController:
             with self._gaze_lock:
                 states = dict(self.gaze_states)
 
-            if loop_count % 30 == 0:
+            if loop_count % 45 == 0:  # Log every ~3 seconds
                 owner = self.active_client_ip or 'host'
                 print(f"[Arbiter] {states} | owner={owner}")
 
@@ -284,7 +290,7 @@ class HostController:
     def run_vision(self):
         """
         Opens the camera in a background capture thread.
-        Gaze is computed at GAZE_FPS (8/s) on 640x480 frames.
+        Gaze is computed at GAZE_FPS on 640x480 frames.
         No cv2 window is shown — everything runs silently.
         """
         print(f"[Vision] Opening camera {self.camera_source} in background mode...")
@@ -323,13 +329,13 @@ class HostController:
         # ── Calibration input listener ────────────────────────────────────────
         threading.Thread(target=self._listen_calibration_input, daemon=True).start()
 
-        print("[Host] Gaze tracking active (background). Status printed every 5s.")
+        print("[Host] Gaze tracking active (background). Status printed every 3s.")
 
         last_process = 0.0
         loop_count   = 0
 
         while True:
-            now = time.time()
+            now = time.perf_counter()
             wait = GAZE_INTERVAL - (now - last_process)
             if wait > 0:
                 time.sleep(wait)
@@ -341,7 +347,7 @@ class HostController:
                 time.sleep(0.02)
                 continue
 
-            last_process = time.time()
+            last_process = time.perf_counter()
             loop_count  += 1
 
             # Handle calibration trigger from terminal
@@ -363,8 +369,8 @@ class HostController:
                 print("[Vision] Host calibration complete. Triggering clients...")
                 self.broadcast_calibration()
 
-            # Status log every 5 seconds
-            if loop_count % (GAZE_FPS * 5) == 0:
+            # Status log every 3 seconds
+            if loop_count % (GAZE_FPS * 3) == 0:
                 focused = confidence >= 0.40
                 status  = "FOCUSED" if focused else "AWAY"
                 owner   = self.active_client_ip or "host"

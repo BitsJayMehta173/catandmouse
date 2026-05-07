@@ -115,8 +115,8 @@ Default is `0` (built-in webcam). Use the listed index if needed.
 ## ▶️ Running the Application
 
 > **All scripts run in the background — no camera window is shown.**
-> Gaze is processed at **8 fps on 640×480 frames** for maximum speed.
-> Status is printed to the terminal every 5 seconds.
+> Gaze is processed at **12 fps on 640×480 frames** (up from 8 fps) for faster switching.
+> Status is printed to the terminal every 3 seconds.
 
 ### Step 1 — On the HOST machine
 
@@ -229,16 +229,20 @@ Calibration is **coordinated** — the host triggers it for all machines simulta
 
 ## ⚡ Performance & Smoothness
 
-The system is optimized for low-latency, "nicer" mouse movement and low CPU usage:
+The system is optimized for a "local-feel" cursor and ultra-low CPU usage.
 
-### 1. Motion Cache (Face Skipping)
-The **Gaze Tracker** uses a motion-detection pipeline. If the difference between two consecutive frames is below a threshold, it skips the expensive MediaPipe ML calculation and returns the previous results. This significantly reduces CPU usage when you are sitting still.
+### 1. Motion Cache (Optimized Face Skipping)
+The **Gaze Tracker** uses a high-performance motion-detection pipeline. It resizes frames to 160x120 and checks for grayscale pixel differences. If you are sitting still, it skips the expensive MediaPipe ML calculation (0.1ms vs 30ms). This keeps your CPU cool.
 
-### 2. Mouse Interpolation (Client Side)
-Instead of the cursor "jumping" to every received UDP packet, the client runs a dedicated **120Hz interpolation thread**. It uses a Linear Interpolation (Lerp) algorithm to smoothly move the cursor toward the target, hiding network jitter and providing a premium, fluid feel.
+### 2. Native Mouse Engine (240Hz + Sub-ms Precision)
+The client uses a **Native Win32 Interpolation Engine** (`native_mouse.py`):
+- **240Hz Update Rate:** Twice the rate of a standard monitor for liquid-smooth motion.
+- **1ms Timer Resolution:** Uses `timeBeginPeriod(1)` to force Windows into high-precision mode, bypassing the standard 15.6ms jitter.
+- **Velocity Prediction:** Predicts where your mouse is going based on its current speed, eliminating the "dragging" feel common in remote desktop software.
+- **EMA Smoothing:** Uses Exponential Moving Averages for natural, organic movement.
 
-### 3. UDP Throttling (Host Side)
-The host throttles mouse updates to **90Hz**. This prevents network saturation and socket buffer overflows on the client while still providing a refresh rate higher than most standard laptop screens.
+### 3. High-Frequency UDP (120Hz)
+The host throttles updates to **120Hz** (up from 90Hz). This matches or exceeds most laptop screen refresh rates, ensuring no frames are dropped.
 
 ---
 

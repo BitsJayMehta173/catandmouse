@@ -40,7 +40,16 @@ R_EYE_IDX   = 263
 L_CHEEK_IDX = 234   # approx left boundary of face
 R_CHEEK_IDX = 454   # approx right boundary of face
 
-# ---------------------------------------------------------------------------
+# ── Motion Cache constants ────────────────────────────────────────────────────
+DIFF_W, DIFF_H = 160, 120        # Downscale for diff check (4x smaller than 640x480)
+MOTION_THRESH  = 0.4              # Mean pixel diff below which we skip detection
+STILL_FRAMES_MAX = 30             # After this many skipped frames, force a re-check
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Pre-allocate reusable buffers to avoid GC pressure
+_face2d_buf = np.zeros((6, 2), dtype=np.float64)
+_dist_buf   = np.zeros((4, 1), dtype=np.float64)
+
 
 class GazeTracker:
     """
@@ -81,32 +90,44 @@ class GazeTracker:
         self.calibration_samples: list = []
         self.headless       = headless
 
-        # ── Motion Cache ──────────────────────────────────────────────────────
-        self.prev_gray      = None
-        self.last_results   = (None, 0.0, (0.0, 0.0, 0.0)) # out, conf, angles
-        self.MOTION_THRESH  = 0.5  # Mean pixel diff below which we skip detection
-        # ──────────────────────────────────────────────────────────────────────
+        # ── Motion Cache (optimised) ─────────────────────────────────────────
+        self._prev_gray_small = None       # Downscaled grayscale for diff
+        self._last_results    = (None, 0.0, (0.0, 0.0, 0.0))
+        self._still_count     = 0          # Consecutive "still" frames
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Pre-allocated camera matrix (updated per-frame if resolution changes)
+        self._cam_matrix = None
+        self._last_w     = 0
+        self._last_h     = 0
 
     # ------------------------------------------------------------------
     def process_frame(self, frame: np.ndarray):
         """
         Returns (annotated_frame_or_None, confidence, angles).
-        Includes a motion cache: if frame delta is tiny, skips landmarker.
+        Includes an optimised motion cache: if frame delta is tiny, skips
+        the expensive MediaPipe landmarker and returns cached results.
         """
         img_h, img_w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Check motion relative to last frame
-        if self.prev_gray is not None and self.is_calibrated:
-            # Quick diff
-            diff = cv2.absdiff(gray, self.prev_gray)
-            score = cv2.mean(diff)[0]
-            if score < self.MOTION_THRESH:
-                # Face hasn't moved much, return cached values
-                return self.last_results
 
-        self.prev_gray = gray
+        # ── Motion cache check (very fast: operates on 160x120 grayscale) ────
+        if self.is_calibrated:
+            small = cv2.resize(frame, (DIFF_W, DIFF_H))
+            gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
+            if self._prev_gray_small is not None:
+                diff = cv2.absdiff(gray_small, self._prev_gray_small)
+                motion_score = diff.mean()   # numpy mean is faster than cv2.mean for small arrays
+
+                if motion_score < MOTION_THRESH and self._still_count < STILL_FRAMES_MAX:
+                    self._still_count += 1
+                    return self._last_results
+                else:
+                    self._still_count = 0
+
+            self._prev_gray_small = gray_small
+
+        # ── MediaPipe inference ──────────────────────────────────────────────
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.detector.detect(mp_img)
@@ -119,11 +140,10 @@ class GazeTracker:
             if not self.headless:
                 cv2.putText(out, "No face", (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-            self.last_results = (out, 0.0, angles)
-            return self.last_results
+            self._last_results = (out, 0.0, angles)
+            return self._last_results
 
         landmarks = result.face_landmarks[0]
-        # ... rest of landmarker logic ...
 
         angles, nose_px = self._head_pose(landmarks, img_w, img_h)
         pitch, yaw, roll = angles
@@ -159,8 +179,8 @@ class GazeTracker:
             self._draw_bar(out, confidence, img_h)
             self._draw_labels(out, confidence, yaw, d_yaw, sym_score)
 
-        self.last_results = (out, confidence, angles)
-        return self.last_results
+        self._last_results = (out, confidence, angles)
+        return self._last_results
 
     # ------------------------------------------------------------------
     # Feature: nose–cheek lateral symmetry
@@ -199,28 +219,32 @@ class GazeTracker:
         return score
 
     # ------------------------------------------------------------------
-    # Head pose via solvePnP
+    # Head pose via solvePnP (optimised with pre-allocated buffers)
     # ------------------------------------------------------------------
     def _head_pose(self, landmarks, img_w, img_h):
-        face_2d = np.array([
-            [landmarks[i].x * img_w, landmarks[i].y * img_h]
-            for i in POSE_IDX
-        ], dtype=np.float64)
+        # Fill pre-allocated buffer
+        for i, idx in enumerate(POSE_IDX):
+            _face2d_buf[i, 0] = landmarks[idx].x * img_w
+            _face2d_buf[i, 1] = landmarks[idx].y * img_h
 
-        focal = img_w
-        cam   = np.array([[focal, 0, img_w/2],
-                          [0, focal, img_h/2],
-                          [0,     0,       1]], dtype=np.float64)
-        dist  = np.zeros((4, 1))
+        # Re-use camera matrix if resolution hasn't changed
+        if img_w != self._last_w or img_h != self._last_h:
+            focal = img_w
+            self._cam_matrix = np.array(
+                [[focal, 0, img_w / 2],
+                 [0, focal, img_h / 2],
+                 [0,     0,        1]], dtype=np.float64)
+            self._last_w = img_w
+            self._last_h = img_h
 
-        ok, rvec, _ = cv2.solvePnP(FACE_3D_MODEL, face_2d, cam, dist)
+        ok, rvec, _ = cv2.solvePnP(FACE_3D_MODEL, _face2d_buf, self._cam_matrix, _dist_buf)
         rmat, _     = cv2.Rodrigues(rvec)
         euler, *_   = cv2.RQDecomp3x3(rmat)
 
         pitch = euler[0] * 360
         yaw   = euler[1] * 360
         roll  = euler[2] * 360
-        return (pitch, yaw, roll), face_2d[0]
+        return (pitch, yaw, roll), _face2d_buf[0]
 
     # ------------------------------------------------------------------
     # Visualization
