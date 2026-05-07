@@ -1,0 +1,5 @@
+pynput
+pyzmq
+opencv-python
+mediapipe
+numpy
