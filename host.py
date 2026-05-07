@@ -33,6 +33,11 @@ class HostController:
         self.sensitivity = 1.5
         self._gaze_lock = threading.Lock()
 
+        # ── Mouse Throttling ──────────────────────────────────────────────────
+        self.last_send_time = 0.0
+        self.SEND_INTERVAL  = 1.0 / 90.0  # 90Hz limit
+        # ──────────────────────────────────────────────────────────────────────
+
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -93,11 +98,16 @@ class HostController:
             if (dx != 0 or dy != 0) and self.active_client_ip:
                 self.vx = max(0.0, min(1.0, self.vx + (dx / sw) * self.sensitivity))
                 self.vy = max(0.0, min(1.0, self.vy + (dy / sh) * self.sensitivity))
-                try:
-                    pkt = network_utils.pack_move(self.vx, self.vy)
-                    self.udp_sock.sendto(pkt, (self.active_client_ip, network_utils.UDP_PORT))
-                except Exception:
-                    pass
+                
+                # Throttle sending to ~90Hz to avoid network saturation
+                now = time.time()
+                if now - self.last_send_time >= self.SEND_INTERVAL:
+                    try:
+                        pkt = network_utils.pack_move(self.vx, self.vy)
+                        self.udp_sock.sendto(pkt, (self.active_client_ip, network_utils.UDP_PORT))
+                        self.last_send_time = now
+                    except Exception:
+                        pass
 
             user32.SetCursorPos(cx, cy)
 

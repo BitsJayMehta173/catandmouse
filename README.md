@@ -197,7 +197,7 @@ Both client scripts will:
 Calibration is **coordinated** — the host triggers it for all machines simultaneously.
 
 1. Make sure **all clients are connected** and their camera windows are open.
-2. On the **HOST machine**, look straight at the camera and press **`C`**.
+2. On the **HOST machine**, look straight at the camera and press **`ENTER`** in the terminal.
 3. The host will collect 40 frames to establish a baseline yaw angle.
 4. Once the host finishes, it automatically sends a calibration command to all clients.
 5. Each client then does its own 40-frame calibration — look straight at your webcam.
@@ -220,10 +220,25 @@ Calibration is **coordinated** — the host triggers it for all machines simulta
 
 ### Controls
 
-| Key | Action |
-|-----|--------|
-| `C` | Start calibration (HOST window only) |
-| `ESC` | Exit the application |
+| Key | Action | Window |
+|-----|--------|--------|
+| `ENTER` | Start calibration | Host Terminal |
+| `Ctrl+C` | Exit application | Any Terminal |
+
+---
+
+## ⚡ Performance & Smoothness
+
+The system is optimized for low-latency, "nicer" mouse movement and low CPU usage:
+
+### 1. Motion Cache (Face Skipping)
+The **Gaze Tracker** uses a motion-detection pipeline. If the difference between two consecutive frames is below a threshold, it skips the expensive MediaPipe ML calculation and returns the previous results. This significantly reduces CPU usage when you are sitting still.
+
+### 2. Mouse Interpolation (Client Side)
+Instead of the cursor "jumping" to every received UDP packet, the client runs a dedicated **120Hz interpolation thread**. It uses a Linear Interpolation (Lerp) algorithm to smoothly move the cursor toward the target, hiding network jitter and providing a premium, fluid feel.
+
+### 3. UDP Throttling (Host Side)
+The host throttles mouse updates to **90Hz**. This prevents network saturation and socket buffer overflows on the client while still providing a refresh rate higher than most standard laptop screens.
 
 ---
 

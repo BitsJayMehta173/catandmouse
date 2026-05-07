@@ -57,8 +57,20 @@ class ClientController:
         self.gaze_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.gaze_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+        # ── Mouse Interpolation Pipeline ──────────────────────────────────────
+        self.target_x_norm  = 0.5
+        self.target_y_norm  = 0.5
+        self.curr_x_norm    = 0.5
+        self.curr_y_norm    = 0.5
+        self.mouse_lock     = threading.Lock()
+        self.LERP_FACTOR    = 0.35  # Smoothness vs Latency (higher = snappier)
+        self.DEADBAND       = 0.0001 # Ignore micro-movements
+        # ──────────────────────────────────────────────────────────────────────
+
     def start(self):
         print(f"[Client] Connecting to Host {self.host_ip}...")
+        # ... (connection logic)
+
 
         while True:
             try:
@@ -82,6 +94,7 @@ class ClientController:
 
         threading.Thread(target=self.listen_udp, daemon=True).start()
         threading.Thread(target=self.listen_tcp, daemon=True).start()
+        threading.Thread(target=self.mouse_interpolator, daemon=True).start()
 
         self.run_vision()
 
@@ -145,11 +158,37 @@ class ClientController:
             inp.mi.mouseData = ctypes.c_ulong(int(dx * WHEEL_DELTA))
             ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
-    # ── Network listeners ─────────────────────────────────────────────────────
+    # ── Mouse & Network listeners ─────────────────────────────────────────────
+
+    def mouse_interpolator(self):
+        """
+        High-frequency thread (120Hz) that smoothly moves the cursor toward
+        the latest target received from UDP. This eliminates 'jumping' feel.
+        """
+        user32 = ctypes.windll.user32
+        sw = user32.GetSystemMetrics(0)
+        sh = user32.GetSystemMetrics(1)
+        
+        while True:
+            time.sleep(1/120.0) # 120 Hz update
+            
+            with self.mouse_lock:
+                tx, ty = self.target_x_norm, self.target_y_norm
+            
+            # Linear Interpolation (Lerp)
+            dx = tx - self.curr_x_norm
+            dy = ty - self.curr_y_norm
+            
+            if abs(dx) > self.DEADBAND or abs(dy) > self.DEADBAND:
+                self.curr_x_norm += dx * self.LERP_FACTOR
+                self.curr_y_norm += dy * self.LERP_FACTOR
+                
+                target_x = int(self.curr_x_norm * (sw - 1))
+                target_y = int(self.curr_y_norm * (sh - 1))
+                user32.SetCursorPos(target_x, target_y)
 
     def listen_udp(self):
         print("[UDP] Listening for mouse movement...")
-        user32 = ctypes.windll.user32
         while True:
             try:
                 data, _ = self.udp_sock.recvfrom(1024)
@@ -157,11 +196,9 @@ class ClientController:
                     continue
                 if struct.unpack('!B', data[:1])[0] == 1:
                     px, py = network_utils.unpack_move(data)
-                    sw = user32.GetSystemMetrics(0)
-                    sh = user32.GetSystemMetrics(1)
-                    px = max(0.0, min(1.0, px))
-                    py = max(0.0, min(1.0, py))
-                    user32.SetCursorPos(int(px * (sw - 1)), int(py * (sh - 1)))
+                    with self.mouse_lock:
+                        self.target_x_norm = max(0.0, min(1.0, px))
+                        self.target_y_norm = max(0.0, min(1.0, py))
             except Exception as e:
                 print(f"[UDP] Error: {e}")
 

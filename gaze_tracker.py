@@ -81,12 +81,32 @@ class GazeTracker:
         self.calibration_samples: list = []
         self.headless       = headless
 
+        # ── Motion Cache ──────────────────────────────────────────────────────
+        self.prev_gray      = None
+        self.last_results   = (None, 0.0, (0.0, 0.0, 0.0)) # out, conf, angles
+        self.MOTION_THRESH  = 0.5  # Mean pixel diff below which we skip detection
+        # ──────────────────────────────────────────────────────────────────────
+
     # ------------------------------------------------------------------
     def process_frame(self, frame: np.ndarray):
         """
         Returns (annotated_frame_or_None, confidence, angles).
-        In headless mode annotated_frame is None — do not try to display it.
+        Includes a motion cache: if frame delta is tiny, skips landmarker.
         """
+        img_h, img_w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Check motion relative to last frame
+        if self.prev_gray is not None and self.is_calibrated:
+            # Quick diff
+            diff = cv2.absdiff(gray, self.prev_gray)
+            score = cv2.mean(diff)[0]
+            if score < self.MOTION_THRESH:
+                # Face hasn't moved much, return cached values
+                return self.last_results
+
+        self.prev_gray = gray
+
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.detector.detect(mp_img)
@@ -99,10 +119,11 @@ class GazeTracker:
             if not self.headless:
                 cv2.putText(out, "No face", (20, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-            return out, 0.0, angles
+            self.last_results = (out, 0.0, angles)
+            return self.last_results
 
         landmarks = result.face_landmarks[0]
-        img_h, img_w = frame.shape[:2]
+        # ... rest of landmarker logic ...
 
         angles, nose_px = self._head_pose(landmarks, img_w, img_h)
         pitch, yaw, roll = angles
@@ -138,7 +159,8 @@ class GazeTracker:
             self._draw_bar(out, confidence, img_h)
             self._draw_labels(out, confidence, yaw, d_yaw, sym_score)
 
-        return out, confidence, angles
+        self.last_results = (out, confidence, angles)
+        return self.last_results
 
     # ------------------------------------------------------------------
     # Feature: nose–cheek lateral symmetry
